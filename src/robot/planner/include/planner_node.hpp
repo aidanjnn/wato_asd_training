@@ -2,15 +2,57 @@
 #define PLANNER_NODE_HPP_
 
 #include "rclcpp/rclcpp.hpp"
+#include "nav_msgs/msg/occupancy_grid.hpp"
+#include "nav_msgs/msg/odometry.hpp"
+#include "nav_msgs/msg/path.hpp"
+#include "geometry_msgs/msg/point_stamped.hpp"
 
 #include "planner_core.hpp"
 
 class PlannerNode : public rclcpp::Node {
-  public:
+public:
     PlannerNode();
 
-  private:
+private:
+    // State machine states
+    enum class State {
+        WAITING_FOR_GOAL,
+        PLANNING,
+        WAITING_FOR_COMPLETION
+    };
+    
+    // Callbacks
+    void mapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
+    void goalCallback(const geometry_msgs::msg::PointStamped::SharedPtr msg);
+    void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg);
+    void timerCallback();
+    
+    // Helper functions
+    bool goalReached();
+    void replan();
+    
+    // Core logic
     robot::PlannerCore planner_;
+    
+    // ROS2 constructs
+    rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr goal_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
+    rclcpp::TimerBase::SharedPtr timer_;
+    
+    // State
+    State state_;
+    nav_msgs::msg::OccupancyGrid::SharedPtr current_map_;
+    geometry_msgs::msg::PointStamped::SharedPtr current_goal_;
+    nav_msgs::msg::Odometry::SharedPtr current_odom_;
+    nav_msgs::msg::Path current_path_;
+    
+    bool has_map_;
+    bool has_goal_;
+    bool has_odom_;
+    
+    double goal_tolerance_;
 };
 
-#endif 
+#endif
