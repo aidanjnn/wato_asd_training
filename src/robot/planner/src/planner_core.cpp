@@ -1,169 +1,139 @@
 #include "planner_core.hpp"
+#include <algorithm>
+#include <limits>
 
 namespace robot
 {
 
-PlannerCore::PlannerCore(const rclcpp::Logger& logger)
-  : logger_(logger),
-    goal_tolerance_(0.5),    // Within 50cm counts as reached
-    cost_threshold_(50)      // Cells with cost > 50 are obstacles
-{
+PlannerCore::PlannerCore(const rclcpp::Logger& logger) 
+: logger_(logger) {
     RCLCPP_INFO(logger_, "PlannerCore initialized");
 }
 
 nav_msgs::msg::Path PlannerCore::planPath(
     const nav_msgs::msg::OccupancyGrid& map,
-    const geometry_msgs::msg::Pose& start_pose,
-    const geometry_msgs::msg::Point& goal_point)
-{
+    const geometry_msgs::msg::Pose& start,
+    const geometry_msgs::msg::Point& goal
+) {
     nav_msgs::msg::Path path;
-    path.header.frame_id = "sim_world";  // Explicitly set this to sim_world
+    path.header.stamp = rclcpp::Clock().now();
+    path.header.frame_id = "sim_world";  // Always use sim_world frame for paths
     
-    // Convert start and goal to grid cells
-    CellIndex start = poseToCell(start_pose, map);
-    CellIndex goal = pointToCell(goal_point, map);
+    // Convert world coordinates to grid coordinates
+    CellIndex start_cell = worldToGrid(start.position.x, start.position.y, map);
+    CellIndex goal_cell = worldToGrid(goal.x, goal.y, map);
     
     // Check if start and goal are valid
-    if (!isValid(start, map) || !isValid(goal, map)) {
-        RCLCPP_ERROR(logger_, "Start or goal is invalid!");
-        return path;  // Return empty path
+    if (!isValidCell(start_cell, map) || !isValidCell(goal_cell, map)) {
+        RCLCPP_WARN(logger_, "Invalid start or goal cell");
+        return path;
     }
     
-    RCLCPP_INFO(logger_, "Planning from (%d, %d) to (%d, %d)", 
-                start.x, start.y, goal.x, goal.y);
+    if (isObstacle(start_cell, map) || isObstacle(goal_cell, map)) {
+        RCLCPP_WARN(logger_, "Start or goal is an obstacle");
+        return path;
+    }
     
-    // A* algorithm
+    // Run A* search
+    std::vector<CellIndex> grid_path = aStarSearch(map, start_cell, goal_cell);
+    
+    if (grid_path.empty()) {
+        RCLCPP_WARN(logger_, "No path found");
+        return path;
+    }
+    
+    // Convert grid path back to world coordinates
+    for (const auto& cell : grid_path) {
+        geometry_msgs::msg::PoseStamped pose_stamped;
+        pose_stamped.header = path.header;
+        pose_stamped.pose = gridToWorld(cell, map);
+        path.poses.push_back(pose_stamped);
+    }
+    
+    RCLCPP_INFO(logger_, "Path planned with %zu waypoints", path.poses.size());
+    return path;
+}
+
+std::vector<CellIndex> PlannerCore::aStarSearch(
+    const nav_msgs::msg::OccupancyGrid& map,
+    const CellIndex& start,
+    const CellIndex& goal
+) {
     std::priority_queue<AStarNode, std::vector<AStarNode>, CompareF> open_set;
-    std::unordered_map<CellIndex, double, CellIndexHash> g_score;  // Cost from start
-    std::unordered_map<CellIndex, CellIndex, CellIndexHash> came_from;  // Parent tracking
+    std::unordered_map<CellIndex, CellIndex, CellIndexHash> came_from;
+    std::unordered_map<CellIndex, double, CellIndexHash> g_score;
+    std::unordered_map<CellIndex, double, CellIndexHash> f_score;
     
-    // Initialize
+    // Initialize scores
     g_score[start] = 0.0;
-    open_set.push(AStarNode(start, heuristic(start, goal)));
+    f_score[start] = heuristic(start, goal);
+    open_set.push(AStarNode(start, f_score[start]));
+    
+    std::unordered_set<CellIndex, CellIndexHash> closed_set;
     
     while (!open_set.empty()) {
-        // Get cell with lowest f_score
-        AStarNode current = open_set.top();
+        AStarNode current_node = open_set.top();
         open_set.pop();
+        CellIndex current = current_node.index;
         
-        // Check if we reached the goal
-        if (current.index == goal) {
-            RCLCPP_INFO(logger_, "Path found!");
-            
+        // Check if we've reached the goal
+        if (current == goal) {
             // Reconstruct path
-            std::vector<CellIndex> cell_path = reconstructPath(start, goal, came_from);
-            
-            // Convert to ROS Path message
-            for (const auto& cell : cell_path) {
-                path.poses.push_back(cellToPose(cell, map));
+            std::vector<CellIndex> path;
+            CellIndex node = goal;
+            while (node != start) {
+                path.push_back(node);
+                node = came_from[node];
             }
-            
+            path.push_back(start);
+            std::reverse(path.begin(), path.end());
             return path;
         }
         
-        // Explore neighbors
-        std::vector<CellIndex> neighbors = getNeighbors(current.index);
+        closed_set.insert(current);
         
+        // Explore neighbors
+        std::vector<CellIndex> neighbors = getNeighbors(current);
         for (const auto& neighbor : neighbors) {
-            // Skip invalid cells
-            if (!isValid(neighbor, map)) {
+            if (closed_set.find(neighbor) != closed_set.end()) {
+                continue;
+            }
+            
+            if (!isValidCell(neighbor, map) || isObstacle(neighbor, map)) {
                 continue;
             }
             
             // Calculate tentative g_score
-            double tentative_g = g_score[current.index] + 1.0;  // Assume cost = 1 per cell
+            double tentative_g_score = g_score[current] + 
+                ((neighbor.x != current.x && neighbor.y != current.y) ? DIAGONAL_COST : STRAIGHT_COST);
             
-            // If this path to neighbor is better than previous
-            if (g_score.find(neighbor) == g_score.end() || tentative_g < g_score[neighbor]) {
-                // Update path
-                came_from[neighbor] = current.index;
-                g_score[neighbor] = tentative_g;
-                double f_score = tentative_g + heuristic(neighbor, goal);
+            if (g_score.find(neighbor) == g_score.end() || tentative_g_score < g_score[neighbor]) {
+                came_from[neighbor] = current;
+                g_score[neighbor] = tentative_g_score;
+                f_score[neighbor] = g_score[neighbor] + heuristic(neighbor, goal);
                 
-                open_set.push(AStarNode(neighbor, f_score));
+                open_set.push(AStarNode(neighbor, f_score[neighbor]));
             }
         }
     }
     
-    RCLCPP_WARN(logger_, "No path found!");
-    return path;  // Return empty path
+    return {}; // No path found
 }
 
-CellIndex PlannerCore::poseToCell(
-    const geometry_msgs::msg::Pose& pose,
-    const nav_msgs::msg::OccupancyGrid& map)
-{
-    int x = static_cast<int>((pose.position.x - map.info.origin.position.x) / map.info.resolution);
-    int y = static_cast<int>((pose.position.y - map.info.origin.position.y) / map.info.resolution);
-    return CellIndex(x, y);
-}
-
-CellIndex PlannerCore::pointToCell(
-    const geometry_msgs::msg::Point& point,
-    const nav_msgs::msg::OccupancyGrid& map)
-{
-    int x = static_cast<int>((point.x - map.info.origin.position.x) / map.info.resolution);
-    int y = static_cast<int>((point.y - map.info.origin.position.y) / map.info.resolution);
-    return CellIndex(x, y);
-}
-
-geometry_msgs::msg::PoseStamped PlannerCore::cellToPose(
-    const CellIndex& cell,
-    const nav_msgs::msg::OccupancyGrid& map)
-{
-    geometry_msgs::msg::PoseStamped pose;
-    pose.header.frame_id = "sim_world";  // Explicitly set frame
-    
-    // Convert cell to world coordinates (center of cell)
-    pose.pose.position.x = map.info.origin.position.x + (cell.x + 0.5) * map.info.resolution;
-    pose.pose.position.y = map.info.origin.position.y + (cell.y + 0.5) * map.info.resolution;
-    pose.pose.position.z = 0.0;
-    
-    pose.pose.orientation.w = 1.0;  // No rotation
-    
-    return pose;
-}
-
-bool PlannerCore::isValid(
-    const CellIndex& cell,
-    const nav_msgs::msg::OccupancyGrid& map)
-{
-    // Check bounds
-    if (cell.x < 0 || cell.x >= static_cast<int>(map.info.width) ||
-        cell.y < 0 || cell.y >= static_cast<int>(map.info.height)) {
-        return false;
-    }
-    
-    // Check if cell is obstacle
-    int index = cell.y * map.info.width + cell.x;
-    int8_t cost = map.data[index];
-    
-    // Unknown cells (-1) are considered valid (optimistic planning)
-    // Cells with high cost are obstacles
-    if (cost > cost_threshold_) {
-        return false;
-    }
-    
-    return true;
-}
-
-double PlannerCore::heuristic(const CellIndex& a, const CellIndex& b)
-{
-    // Euclidean distance
+double PlannerCore::heuristic(const CellIndex& a, const CellIndex& b) {
+    // Euclidean distance heuristic
     double dx = a.x - b.x;
     double dy = a.y - b.y;
     return std::sqrt(dx * dx + dy * dy);
 }
 
-std::vector<CellIndex> PlannerCore::getNeighbors(const CellIndex& cell)
-{
+std::vector<CellIndex> PlannerCore::getNeighbors(const CellIndex& cell) {
     std::vector<CellIndex> neighbors;
     
-    // 8-connected grid (including diagonals)
+    // 8-connected neighbors
     for (int dx = -1; dx <= 1; ++dx) {
         for (int dy = -1; dy <= 1; ++dy) {
-            if (dx == 0 && dy == 0) continue;  // Skip self
-            
+            if (dx == 0 && dy == 0) continue;
             neighbors.push_back(CellIndex(cell.x + dx, cell.y + dy));
         }
     }
@@ -171,25 +141,49 @@ std::vector<CellIndex> PlannerCore::getNeighbors(const CellIndex& cell)
     return neighbors;
 }
 
-std::vector<CellIndex> PlannerCore::reconstructPath(
-    const CellIndex& start,
-    const CellIndex& goal,
-    const std::unordered_map<CellIndex, CellIndex, CellIndexHash>& came_from)
-{
-    std::vector<CellIndex> path;
-    CellIndex current = goal;
-    
-    // Trace back from goal to start
-    while (current != start) {
-        path.push_back(current);
-        current = came_from.at(current);
+CellIndex PlannerCore::worldToGrid(
+    double x, double y, 
+    const nav_msgs::msg::OccupancyGrid& map
+) {
+    // Use the same coordinate conversion as the working repository
+    // Map origin is at the CENTER, not bottom-left
+    int grid_x = static_cast<int>(x / map.info.resolution + static_cast<int>(map.info.width / 2));
+    int grid_y = static_cast<int>(y / map.info.resolution + static_cast<int>(map.info.height / 2));
+    return CellIndex(grid_x, grid_y);
+}
+
+geometry_msgs::msg::Pose PlannerCore::gridToWorld(
+    const CellIndex& cell,
+    const nav_msgs::msg::OccupancyGrid& map
+) {
+    geometry_msgs::msg::Pose pose;
+    // Use the same coordinate conversion as the working repository
+    // Map origin is at the CENTER, not bottom-left
+    pose.position.x = (cell.x - static_cast<int>(map.info.width / 2)) * map.info.resolution;
+    pose.position.y = (cell.y - static_cast<int>(map.info.height / 2)) * map.info.resolution;
+    pose.position.z = 0.0;
+    pose.orientation.w = 1.0;
+    return pose;
+}
+
+bool PlannerCore::isValidCell(
+    const CellIndex& cell,
+    const nav_msgs::msg::OccupancyGrid& map
+) {
+    return cell.x >= 0 && cell.x < static_cast<int>(map.info.width) &&
+           cell.y >= 0 && cell.y < static_cast<int>(map.info.height);
+}
+
+bool PlannerCore::isObstacle(
+    const CellIndex& cell,
+    const nav_msgs::msg::OccupancyGrid& map
+) {
+    if (!isValidCell(cell, map)) {
+        return true;
     }
-    path.push_back(start);
     
-    // Reverse to get start -> goal
-    std::reverse(path.begin(), path.end());
-    
-    return path;
+    int index = cell.y * map.info.width + cell.x;
+    return map.data[index] > OCCUPIED_THRESHOLD;
 }
 
 }

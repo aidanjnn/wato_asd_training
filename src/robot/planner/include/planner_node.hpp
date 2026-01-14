@@ -18,7 +18,7 @@ private:
     enum class State {
         WAITING_FOR_GOAL,
         PLANNING,
-        WAITING_FOR_COMPLETION
+        WAITING_FOR_ROBOT_TO_REACH_GOAL
     };
     
     // Callbacks
@@ -29,7 +29,7 @@ private:
     
     // Helper functions
     bool goalReached();
-    void replan();
+    void planPath();
     
     // Core logic
     robot::PlannerCore planner_;
@@ -43,16 +43,14 @@ private:
     
     // State
     State state_;
-    nav_msgs::msg::OccupancyGrid::SharedPtr current_map_;
-    geometry_msgs::msg::PointStamped::SharedPtr current_goal_;
-    nav_msgs::msg::Odometry::SharedPtr current_odom_;
-    nav_msgs::msg::Path current_path_;
+    nav_msgs::msg::OccupancyGrid current_map_;
+    geometry_msgs::msg::PointStamped goal_;
+    geometry_msgs::msg::Pose robot_pose_;
     
-    bool has_map_;
-    bool has_goal_;
-    bool has_odom_;
+    bool map_received_;
+    bool goal_received_;
     
-    double goal_tolerance_;
+    static constexpr double GOAL_THRESHOLD = 0.5;
 };
 
 #endif

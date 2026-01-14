@@ -4,109 +4,119 @@
 #include "rclcpp/rclcpp.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "nav_msgs/msg/path.hpp"
-#include "geometry_msgs/msg/pose_stamped.hpp"
-#include <vector>
-#include <queue>
+#include "geometry_msgs/msg/pose.hpp"
+#include "geometry_msgs/msg/point.hpp"
 #include <unordered_map>
+#include <unordered_set>
+#include <queue>
+#include <vector>
 #include <cmath>
 #include <algorithm>
 
-namespace robot
-{
 
-// Structure for 2D grid index
+//A* Structures
+//2D Grid Index
 struct CellIndex
 {
   int x;
   int y;
-
+  
   CellIndex(int xx, int yy) : x(xx), y(yy) {}
   CellIndex() : x(0), y(0) {}
-
+  
   bool operator==(const CellIndex &other) const
   {
     return (x == other.x && y == other.y);
   }
-
+  
   bool operator!=(const CellIndex &other) const
   {
     return (x != other.x || y != other.y);
   }
 };
-
-// Hash function for CellIndex (needed for unordered_map)
+  
+// Hash function for CellIndex so it can be used in std::unordered_map
 struct CellIndexHash
 {
   std::size_t operator()(const CellIndex &idx) const
   {
+    // A simple hash combining x and y
     return std::hash<int>()(idx.x) ^ (std::hash<int>()(idx.y) << 1);
   }
 };
-
-// Structure for A* node (cell + cost)
+  
+// Structure representing a node in the A* open set
 struct AStarNode
 {
   CellIndex index;
-  double f_score;  // f = g + h (total estimated cost)
-
+  double f_score;  // f = g + h
+  
   AStarNode(CellIndex idx, double f) : index(idx), f_score(f) {}
 };
-
-// Comparator for priority queue (min-heap by f_score)
+  
+// Comparator for the priority queue (min-heap by f_score)
 struct CompareF
 {
   bool operator()(const AStarNode &a, const AStarNode &b)
   {
-    return a.f_score > b.f_score;  // Smaller f_score = higher priority
+    // We want the node with the smallest f_score on top
+    return a.f_score > b.f_score;
   }
 };
 
-class PlannerCore {
-public:
-    explicit PlannerCore(const rclcpp::Logger& logger);
-    
-    // Main A* planning function
-    nav_msgs::msg::Path planPath(
-        const nav_msgs::msg::OccupancyGrid& map,
-        const geometry_msgs::msg::Pose& start_pose,
-        const geometry_msgs::msg::Point& goal_point);
+namespace robot
+{
 
-private:
+class PlannerCore {
+  public:
+    explicit PlannerCore(const rclcpp::Logger& logger);
+
+    // ------------------- Pathfinding Methods -------------------
+    nav_msgs::msg::Path planPath(
+      const nav_msgs::msg::OccupancyGrid& map,
+      const geometry_msgs::msg::Pose& start,
+      const geometry_msgs::msg::Point& goal
+    );
+  
+  std::vector<CellIndex> aStarSearch(
+      const nav_msgs::msg::OccupancyGrid& map,
+      const CellIndex& start,
+      const CellIndex& goal
+  );
+  
+  double heuristic(const CellIndex& a, const CellIndex& b);
+  std::vector<CellIndex> getNeighbors(const CellIndex& cell);
+  
+  // ------------------- Utility Methods -------------------
+  CellIndex worldToGrid(
+      double x, double y, 
+      const nav_msgs::msg::OccupancyGrid& map
+  );
+  
+  geometry_msgs::msg::Pose gridToWorld(
+      const CellIndex& cell,
+      const nav_msgs::msg::OccupancyGrid& map
+  );
+  
+  bool isValidCell(
+      const CellIndex& cell,
+      const nav_msgs::msg::OccupancyGrid& map
+  );
+  
+  bool isObstacle(
+      const CellIndex& cell,
+      const nav_msgs::msg::OccupancyGrid& map
+  );
+
+  private:
     rclcpp::Logger logger_;
     
-    // A* parameters
-    double goal_tolerance_;  // How close to goal counts as "reached" (0.5m)
-    int cost_threshold_;     // Cell cost above this is obstacle (50)
-    
-    // Helper functions
-    CellIndex poseToCell(
-        const geometry_msgs::msg::Pose& pose,
-        const nav_msgs::msg::OccupancyGrid& map);
-    
-    CellIndex pointToCell(
-        const geometry_msgs::msg::Point& point,
-        const nav_msgs::msg::OccupancyGrid& map);
-    
-    geometry_msgs::msg::PoseStamped cellToPose(
-        const CellIndex& cell,
-        const nav_msgs::msg::OccupancyGrid& map);
-    
-    bool isValid(
-        const CellIndex& cell,
-        const nav_msgs::msg::OccupancyGrid& map);
-    
-    double heuristic(
-        const CellIndex& a,
-        const CellIndex& b);
-    
-    std::vector<CellIndex> getNeighbors(const CellIndex& cell);
-    
-    std::vector<CellIndex> reconstructPath(
-        const CellIndex& start,
-        const CellIndex& goal,
-        const std::unordered_map<CellIndex, CellIndex, CellIndexHash>& came_from);
+    // A* algorithm constants
+    static constexpr double DIAGONAL_COST = 1.414;
+    static constexpr double STRAIGHT_COST = 1.0;
+    static constexpr int8_t OCCUPIED_THRESHOLD = 50;
 };
 
-}
+}  
 
 #endif

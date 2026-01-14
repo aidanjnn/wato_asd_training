@@ -1,133 +1,115 @@
 #include "planner_node.hpp"
+#include <cmath>
 
-PlannerNode::PlannerNode()
-  : Node("planner"),
-    planner_(robot::PlannerCore(this->get_logger())),
-    state_(State::WAITING_FOR_GOAL),
-    has_map_(false),
-    has_goal_(false),
-    has_odom_(false),
-    goal_tolerance_(0.5)  // 50cm
+PlannerNode::PlannerNode() 
+  : Node("planner"), 
+    planner_(robot::PlannerCore(this->get_logger())), 
+    state_(State::WAITING_FOR_GOAL) 
 {
-    // Subscribe to map
+    // Initialize subscribers
     map_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
-        "/map", 10,
-        std::bind(&PlannerNode::mapCallback, this, std::placeholders::_1));
+        "/map", 10, [this](const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+            this->mapCallback(msg);
+        });
     
-    // Subscribe to goal
     goal_sub_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
-        "/goal_point", 10,
-        std::bind(&PlannerNode::goalCallback, this, std::placeholders::_1));
+        "/goal_point", 10, [this](const geometry_msgs::msg::PointStamped::SharedPtr msg) {
+            this->goalCallback(msg);
+        });
     
-    // Subscribe to odometry
     odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-        "/odom/filtered", 10,
-        std::bind(&PlannerNode::odomCallback, this, std::placeholders::_1));
+        "/odom/filtered", 10, [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
+            this->odomCallback(msg);
+        });
     
-    // Publish path
+    // Initialize publisher
     path_pub_ = this->create_publisher<nav_msgs::msg::Path>("/path", 10);
     
-    // Timer for periodic checks (2 Hz)
+    // Initialize timer
     timer_ = this->create_wall_timer(
-        std::chrono::milliseconds(500),
-        std::bind(&PlannerNode::timerCallback, this));
+        std::chrono::milliseconds(500), [this]() { this->timerCallback(); });
     
-    RCLCPP_INFO(this->get_logger(), "Planner node initialized");
+    RCLCPP_INFO(this->get_logger(), "PlannerNode initialized - listening to /map, waiting for goal");
 }
 
-void PlannerNode::mapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
-{
-    current_map_ = msg;
-    has_map_ = true;
+void PlannerNode::mapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+    current_map_ = *msg;
+    map_received_ = true;
     
-    // If we're waiting for completion and map updated, replan
-    if (state_ == State::WAITING_FOR_COMPLETION && has_goal_ && has_odom_) {
-        replan();
+    if (state_ == State::WAITING_FOR_ROBOT_TO_REACH_GOAL) {
+        planPath();
     }
 }
 
-void PlannerNode::goalCallback(const geometry_msgs::msg::PointStamped::SharedPtr msg)
-{
-    current_goal_ = msg;
-    has_goal_ = true;
+void PlannerNode::goalCallback(const geometry_msgs::msg::PointStamped::SharedPtr msg) {
+    goal_ = *msg;
+    goal_received_ = true;
+    state_ = State::WAITING_FOR_ROBOT_TO_REACH_GOAL;
     
-    RCLCPP_INFO(this->get_logger(), "New goal received: (%.2f, %.2f)",
-                msg->point.x, msg->point.y);
+    RCLCPP_INFO(this->get_logger(), "Goal received: (%.2f, %.2f)", 
+                goal_.point.x, goal_.point.y);
     
-    // Transition to planning state
-    state_ = State::PLANNING;
-    
-    // Plan immediately
-    replan();
+    if (map_received_) {
+        planPath();
+    }
 }
 
-void PlannerNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
-{
-    current_odom_ = msg;
-    has_odom_ = true;
+void PlannerNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+    robot_pose_ = msg->pose.pose;
 }
 
-void PlannerNode::timerCallback()
-{
-    if (state_ == State::WAITING_FOR_COMPLETION) {
-        // Check if goal reached
+void PlannerNode::timerCallback() {
+    if (state_ == State::WAITING_FOR_ROBOT_TO_REACH_GOAL) {
         if (goalReached()) {
             RCLCPP_INFO(this->get_logger(), "Goal reached!");
             state_ = State::WAITING_FOR_GOAL;
-            has_goal_ = false;
+        } else if (map_received_) {
+            // Replan periodically to handle dynamic obstacles
+            planPath();
         }
-    }
-    
-    // Always publish current path (even if empty)
-    if (has_map_) {
-        current_path_.header.stamp = this->get_clock()->now();
-        path_pub_->publish(current_path_);
     }
 }
 
-bool PlannerNode::goalReached()
-{
-    if (!has_odom_ || !has_goal_) {
+bool PlannerNode::goalReached() {
+    if (!goal_received_) {
         return false;
     }
     
-    double dx = current_odom_->pose.pose.position.x - current_goal_->point.x;
-    double dy = current_odom_->pose.pose.position.y - current_goal_->point.y;
+    double dx = goal_.point.x - robot_pose_.position.x;
+    double dy = goal_.point.y - robot_pose_.position.y;
     double distance = std::sqrt(dx * dx + dy * dy);
     
-    return distance < goal_tolerance_;
+    return distance < GOAL_THRESHOLD;
 }
 
-void PlannerNode::replan()
-{
-    if (!has_map_ || !has_goal_ || !has_odom_) {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                             "Waiting for map, goal, and odometry...");
+void PlannerNode::planPath() {
+    if (!goal_received_ || !map_received_) {
+        RCLCPP_WARN(this->get_logger(), "Cannot plan path: Missing map or goal!");
         return;
     }
     
-    RCLCPP_INFO(this->get_logger(), "Planning path...");
-    
-    // Plan path using A*
-    current_path_ = planner_.planPath(
-        *current_map_,
-        current_odom_->pose.pose,
-        current_goal_->point);
-    
-    if (current_path_.poses.empty()) {
-        RCLCPP_ERROR(this->get_logger(), "Failed to find path!");
-        state_ = State::WAITING_FOR_GOAL;
-    } else {
-        RCLCPP_INFO(this->get_logger(), "Path found with %zu waypoints",
-                    current_path_.poses.size());
-        state_ = State::WAITING_FOR_COMPLETION;
+    if (current_map_.data.empty()) {
+        RCLCPP_WARN(this->get_logger(), "Cannot plan path: Empty map!");
+        return;
     }
+    
+    // Create a path using the planner core
+    nav_msgs::msg::Path path = planner_.planPath(current_map_, robot_pose_, goal_.point);
+    
+    if (path.poses.empty()) {
+        RCLCPP_WARN(this->get_logger(), "No path found to goal!");
+        return;
+    }
+    
+    // Publish the path
+    path_pub_->publish(path);
+    RCLCPP_INFO(this->get_logger(), "Published path with %zu waypoints", path.poses.size());
 }
 
-int main(int argc, char** argv)
+int main(int argc, char ** argv)
 {
-    rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<PlannerNode>());
-    rclcpp::shutdown();
-    return 0;
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<PlannerNode>());
+  rclcpp::shutdown();
+  return 0;
 }
